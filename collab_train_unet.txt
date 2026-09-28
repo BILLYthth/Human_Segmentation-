@@ -1,0 +1,280 @@
+import tensorflow as tf
+print("TF version:", tf.__version__)
+print("GPU available:", tf.config.list_physical_devices('GPU'))
+
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+from google.colab import drive
+drive.mount('/content/drive')
+# Then set DATA_DIR = "/content/drive/MyDrive/segmentation_dataset/dataset_split"
+
+import os
+import csv
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
+
+# ========== CONFIG ==========
+DATA_DIR  = "/content/drive/MyDrive/segmentation_dataset/dataset_split"
+SAVE_DIR  = "/content/drive/MyDrive/unet_training"
+IMG_SIZE  = (256, 256)
+BATCH_SIZE = 8
+EPOCHS    = 300        # was 80 — way too few
+LR        = 3e-4       # fixed, no scheduler
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+# ========== DATA PIPELINE ==========
+def load_pair(img_path, mask_path):
+    img  = tf.io.read_file(img_path)
+    img  = tf.image.decode_jpeg(img, channels=3)
+    img  = tf.image.resize(img, IMG_SIZE)
+    img  = tf.cast(img, tf.float32) / 255.0
+
+    mask = tf.io.read_file(mask_path)
+    mask = tf.image.decode_png(mask, channels=1)
+    mask = tf.image.resize(mask, IMG_SIZE, method="nearest")
+    mask = tf.cast(mask > 0, tf.float32)
+    return img, mask
+
+
+def augment(img, mask):
+    # Joint spatial transforms — concat so img+mask stay aligned
+    combined = tf.concat([img, mask], axis=-1)
+
+    if tf.random.uniform(()) > 0.5:
+        combined = tf.image.flip_left_right(combined)
+    if tf.random.uniform(()) > 0.5:
+        combined = tf.image.flip_up_down(combined)
+
+    k = tf.random.uniform((), 0, 4, dtype=tf.int32)
+    combined = tf.image.rot90(combined, k)
+
+    # Random crop + resize (zoom)
+    if tf.random.uniform(()) > 0.4:
+        crop_frac = tf.random.uniform((), 0.75, 1.0)
+        h = tf.cast(tf.cast(IMG_SIZE[0], tf.float32) * crop_frac, tf.int32)
+        w = tf.cast(tf.cast(IMG_SIZE[1], tf.float32) * crop_frac, tf.int32)
+        combined = tf.image.random_crop(combined, size=[h, w, 4])
+        combined = tf.image.resize(combined, IMG_SIZE)
+
+    img  = combined[:, :, :3]
+    mask = combined[:, :, 3:]
+
+    # Color jitter — image only
+    if tf.random.uniform(()) > 0.3:
+        img = tf.image.random_brightness(img, 0.3)
+    if tf.random.uniform(()) > 0.3:
+        img = tf.image.random_contrast(img, 0.6, 1.4)
+    if tf.random.uniform(()) > 0.3:
+        img = tf.image.random_saturation(img, 0.7, 1.3)
+    if tf.random.uniform(()) > 0.4:
+        img = tf.image.random_hue(img, 0.05)
+
+    # Cutout
+    if tf.random.uniform(()) > 0.5:
+        cx = tf.random.uniform((), 40, IMG_SIZE[1]-40, dtype=tf.int32)
+        cy = tf.random.uniform((), 40, IMG_SIZE[0]-40, dtype=tf.int32)
+        sz = tf.random.uniform((), 20, 60, dtype=tf.int32)
+        x1 = tf.maximum(0, cx - sz // 2)
+        y1 = tf.maximum(0, cy - sz // 2)
+        x2 = tf.minimum(IMG_SIZE[1], cx + sz // 2)
+        y2 = tf.minimum(IMG_SIZE[0], cy + sz // 2)
+        patch     = tf.ones([y2-y1, x2-x1, 3]) * 0.5
+        padding   = [[y1, IMG_SIZE[0]-y2], [x1, IMG_SIZE[1]-x2], [0, 0]]
+        patch_full = tf.pad(patch, padding)
+        hole_mask  = tf.pad(tf.ones([y2-y1, x2-x1, 3]), padding)
+        img = img * (1.0 - hole_mask) + patch_full * hole_mask
+
+    img  = tf.clip_by_value(img,  0.0, 1.0)
+    mask = tf.clip_by_value(mask, 0.0, 1.0)
+    return img, mask
+
+
+def make_dataset(split):
+    img_dir  = os.path.join(DATA_DIR, "images", split)
+    mask_dir = os.path.join(DATA_DIR, "masks",  split)
+
+    # Safe matched-pair loading — no silent mismatches
+    img_stems  = {os.path.splitext(f)[0]: f for f in os.listdir(img_dir)}
+    mask_stems = {os.path.splitext(f)[0]: f for f in os.listdir(mask_dir)}
+    matched    = sorted(set(img_stems) & set(mask_stems))
+    print(f"  [{split}] matched pairs: {len(matched)}")
+
+    imgs  = [os.path.join(img_dir,  img_stems[s])  for s in matched]
+    masks = [os.path.join(mask_dir, mask_stems[s]) for s in matched]
+
+    ds = tf.data.Dataset.from_tensor_slices((imgs, masks))
+    ds = ds.map(load_pair, num_parallel_calls=tf.data.AUTOTUNE)
+    if split == "train":
+        ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.shuffle(buffer_size=len(matched))
+    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+
+print("Loading datasets...")
+train_ds = make_dataset("train")
+val_ds   = make_dataset("val")
+
+
+# ========== LOSS & METRICS ==========
+def dice_loss(y_true, y_pred, smooth=1e-6):
+    y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
+    intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2, 3])
+    union = (tf.reduce_sum(y_true, axis=[1, 2, 3])
+             + tf.reduce_sum(y_pred, axis=[1, 2, 3]))
+    return tf.reduce_mean(1 - (2. * intersection + smooth) / (union + smooth))
+
+def combined_loss(y_true, y_pred):
+    bce = tf.reduce_mean(tf.keras.losses.binary_crossentropy(y_true, y_pred))
+    return 0.3 * bce + 0.7 * dice_loss(y_true, y_pred)
+
+def dice_metric(y_true, y_pred, smooth=1e-6):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred > 0.5, tf.float32)
+    intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2, 3])
+    union = (tf.reduce_sum(y_true, axis=[1, 2, 3])
+             + tf.reduce_sum(y_pred, axis=[1, 2, 3]))
+    return tf.reduce_mean((2. * intersection + smooth) / (union + smooth))
+
+def iou_metric(y_true, y_pred, smooth=1e-6):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred > 0.5, tf.float32)
+    intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2, 3])
+    union = (tf.reduce_sum(y_true, axis=[1, 2, 3])
+             + tf.reduce_sum(y_pred, axis=[1, 2, 3])
+             - intersection)
+    return tf.reduce_mean((intersection + smooth) / (union + smooth))
+
+
+# ========== MODEL ==========
+def conv_block(x, filters, l2=1e-4):
+    reg = regularizers.l2(l2)
+    x = layers.Conv2D(filters, 3, padding="same", kernel_regularizer=reg)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Conv2D(filters, 3, padding="same", kernel_regularizer=reg)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    return x
+
+def unet(base=64):
+    inputs = layers.Input(IMG_SIZE + (3,))
+
+    c1 = conv_block(inputs, base)
+    p1 = layers.MaxPooling2D()(c1)
+    p1 = layers.Dropout(0.3)(p1)
+
+    c2 = conv_block(p1, base * 2)
+    p2 = layers.MaxPooling2D()(c2)
+    p2 = layers.Dropout(0.3)(p2)
+
+    b  = conv_block(p2, base * 4)
+    b  = layers.Dropout(0.4)(b)
+
+    u1 = layers.UpSampling2D()(b)
+    u1 = layers.Concatenate()([u1, c2])
+    c3 = conv_block(u1, base * 2)
+    c3 = layers.Dropout(0.3)(c3)
+
+    u2 = layers.UpSampling2D()(c3)
+    u2 = layers.Concatenate()([u2, c1])
+    c4 = conv_block(u2, base)
+
+    outputs = layers.Conv2D(1, 1, activation="sigmoid")(c4)
+    return models.Model(inputs, outputs)
+
+model = unet()
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=LR),
+    loss=combined_loss,
+    metrics=["accuracy", dice_metric, iou_metric]
+)
+model.summary()
+
+
+# ========== CALLBACKS ==========
+class SaveBestModels(tf.keras.callbacks.Callback):
+    def __init__(self, save_dir):
+        super().__init__()
+        self.save_dir        = save_dir
+        self.best_val_dice   = -1.0
+        self.best_train_dice = -1.0
+        self.log_rows        = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs       = logs or {}
+        train_dice = logs.get("dice_metric", 0.0)
+        val_dice   = logs.get("val_dice_metric", 0.0)
+
+        if train_dice > self.best_train_dice:
+            self.best_train_dice = train_dice
+            self.model.save(os.path.join(self.save_dir, "best_train_dice.keras"))
+            print(f"  ✅ Best train dice {train_dice:.4f}")
+
+        if val_dice > self.best_val_dice:
+            self.best_val_dice = val_dice
+            self.model.save(os.path.join(self.save_dir, "best_val_dice.keras"))
+            print(f"  🏆 Best val dice   {val_dice:.4f}")
+
+        self.log_rows.append({
+            "epoch":           epoch + 1,
+            "loss":            round(logs.get("loss", 0), 4),
+            "accuracy":        round(logs.get("accuracy", 0), 4),
+            "dice_metric":     round(train_dice, 4),
+            "iou_metric":      round(logs.get("iou_metric", 0), 4),
+            "val_loss":        round(logs.get("val_loss", 0), 4),
+            "val_accuracy":    round(logs.get("val_accuracy", 0), 4),
+            "val_dice_metric": round(val_dice, 4),
+            "val_iou_metric":  round(logs.get("val_iou_metric", 0), 4),
+            "best_val_dice":   round(self.best_val_dice, 4),
+        })
+
+        csv_path = os.path.join(self.save_dir, "training_log.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.log_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(self.log_rows)
+
+
+class TargetStop(tf.keras.callbacks.Callback):
+    """Stop only when BOTH val_dice > 0.85 AND val_iou > 0.80."""
+    def on_epoch_end(self, epoch, logs=None):
+        logs     = logs or {}
+        val_dice = logs.get("val_dice_metric", 0.0)
+        val_iou  = logs.get("val_iou_metric",  0.0)
+        if val_dice >= 0.85 and val_iou >= 0.80:
+            print(f"\n🎯 Target reached! val_dice={val_dice:.4f}, val_iou={val_iou:.4f} — stopping.")
+            self.model.stop_training = True
+
+
+callbacks = [
+    SaveBestModels(SAVE_DIR),
+    TargetStop(),
+    # EarlyStopping only as a last resort — very generous patience
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_dice_metric",
+        patience=60,           # was 20 — now gives model room to breathe
+        mode="max",
+        restore_best_weights=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.CSVLogger(
+        os.path.join(SAVE_DIR, "full_log.csv")
+    ),
+]
+
+
+# ========== TRAIN ==========
+print("\n========== Starting training ==========")
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=callbacks
+)
+
+model.save(os.path.join(SAVE_DIR, "last_unet.keras"))
+print(f"\nDone. All models saved to {SAVE_DIR}")
